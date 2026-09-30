@@ -8,9 +8,10 @@ from fastapi import Depends, FastAPI, HTTPException
 
 from . import db
 from .schemas import (GroupCreate, InterferenceCreate, PlanCreate,
-                      SessionCreate)
+                      SessionCreate, TransitionQuery)
 from .solver import (FrequencySolver, SolverLimitExceeded, analyze_unsat,
                      intervals_overlap)
+from .transition import TransitionSolver, assignment_violations
 
 
 @asynccontextmanager
@@ -25,13 +26,24 @@ app = FastAPI(
     title="频点协调服务",
     version="1.0.0",
     description="为临时演出的无线电设备组协调频点：录入场次、设备组时段与"
-                "干扰关系，按约束规划并发布不可变的频点分配版本。",
+                "干扰关系，按约束规划并发布不可变的频点分配版本，并可查询"
+                "两个发布版之间的逐组安全调频路线。",
     lifespan=lifespan,
 )
 
 
 def bad_request(message: str):
     return HTTPException(status_code=400, detail=message)
+
+
+def invalid_transition(error: str, message: str, **extra):
+    return HTTPException(status_code=400,
+                         detail={"error": error, "message": message, **extra})
+
+
+def assignment_items(assignment: dict[int, int]):
+    return [{"group_id": gid, "frequency": assignment[gid]}
+            for gid in sorted(assignment)]
 
 
 # --------------------------------------------------------------------- #
@@ -255,6 +267,132 @@ def publish_plan(session_id: int, payload: PlanCreate,
         "locks": [{"group_id": gid, "frequency": freq}
                   for gid, freq in sorted(locks.items())],
         "created_at": created_at,
+    }
+
+
+# --------------------------------------------------------------------- #
+# 发布版之间的逐组安全调频路线
+# --------------------------------------------------------------------- #
+def _active_edges(groups, interferences):
+    """按左闭右开时段过滤当前生效的干扰关系。"""
+    group_by_id = {g["id"]: g for g in groups}
+    edges = []
+    for interference in interferences:
+        ga = group_by_id[interference["group_a"]]
+        gb = group_by_id[interference["group_b"]]
+        if intervals_overlap(ga["start"], ga["end"], gb["start"], gb["end"]):
+            edges.append((interference["group_a"], interference["group_b"],
+                          interference["min_separation"]))
+    return edges
+
+
+@app.post("/sessions/{session_id}/transitions")
+def plan_transition(session_id: int, payload: TransitionQuery,
+                    conn=Depends(db.get_readonly_conn)):
+    """规划两个既有发布版之间的逐组安全调频步骤，不修改任何发布版。"""
+    session = _load_session(conn, session_id)
+    groups = _load_groups(conn, session_id)
+    group_ids = [g["id"] for g in groups]
+    group_set = set(group_ids)
+    interferences = _load_interferences(conn, session_id)
+    edges = _active_edges(groups, interferences)
+
+    start_plan = _load_plan(conn, session_id, payload.start_version)
+    target_plan = _load_plan(conn, session_id, payload.target_version)
+    start = _load_assignments(conn, start_plan["id"])
+    target = _load_assignments(conn, target_plan["id"])
+
+    start_groups = set(start)
+    target_groups = set(target)
+    if start_groups != target_groups:
+        raise invalid_transition(
+            "group_set_mismatch",
+            "起始版与目标版的组集合不同，不能逐组切换；请先发布组集合一致"
+            "的新版本",
+            start_version=payload.start_version,
+            target_version=payload.target_version,
+            start_groups=sorted(start_groups),
+            target_groups=sorted(target_groups))
+
+    fixed_groups = []
+    for group_id in payload.fixed_groups:
+        if group_id in fixed_groups:
+            raise invalid_transition(
+                "fixed_group_repeated", f"不可调频组 {group_id} 重复引用",
+                group_id=group_id)
+        if group_id not in group_set:
+            raise invalid_transition(
+                "fixed_group_unknown", f"不可调频组 {group_id} 不是本场次组",
+                group_id=group_id)
+        fixed_groups.append(group_id)
+
+    fixed_conflicts = [
+        {"group_id": group_id,
+         "start_frequency": start[group_id],
+         "target_frequency": target[group_id]}
+        for group_id in fixed_groups
+        if group_id in start and group_id in target
+        and start[group_id] != target[group_id]
+    ]
+    if fixed_conflicts:
+        raise invalid_transition(
+            "fixed_group_conflict",
+            "不可调频组在起始版与目标版中的频点必须相同",
+            conflicts=fixed_conflicts)
+
+    start_violations = assignment_violations(
+        start, group_ids, session["frequencies"], edges)
+    target_violations = assignment_violations(
+        target, group_ids, session["frequencies"], edges)
+    has_violation = any(start_violations.values()) or any(
+        target_violations.values())
+    if has_violation:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "endpoint_infeasible",
+                "message": "起始版或目标版在当前配置规则下不可行",
+                "endpoints": {
+                    "start": start_violations,
+                    "target": target_violations,
+                },
+            })
+
+    try:
+        route = TransitionSolver(
+            group_ids, session["frequencies"], edges, start, target,
+            fixed_groups).solve()
+    except SolverLimitExceeded:
+        raise HTTPException(status_code=503,
+                            detail="路线搜索超出资源限制，请缩小规模后重试")
+
+    if route is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "no_safe_route",
+                "message": "两端点均可行，但无法逐组完成安全切换",
+                "start_version": payload.start_version,
+                "target_version": payload.target_version,
+                "fixed_groups": fixed_groups,
+            })
+
+    return {
+        "session_id": session_id,
+        "start_version": payload.start_version,
+        "target_version": payload.target_version,
+        "fixed_groups": fixed_groups,
+        "step_count": len(route),
+        "initial_assignment": assignment_items(start),
+        "steps": [
+            {"step": item["step"],
+             "group_id": item["group_id"],
+             "from_frequency": item["from_frequency"],
+             "to_frequency": item["to_frequency"],
+             "assignment": assignment_items(item["assignment"])}
+            for item in route
+        ],
+        "target_assignment": assignment_items(target),
     }
 
 

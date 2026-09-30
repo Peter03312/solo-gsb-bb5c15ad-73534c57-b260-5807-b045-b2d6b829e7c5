@@ -32,3 +32,10 @@ class PlanCreate(BaseModel):
     base_version: int = Field(
         ge=0, description="所见版本号；无发布版时为 0，否则为最新发布版号")
     locks: list[Lock] = Field(default_factory=list)
+
+
+class TransitionQuery(BaseModel):
+    start_version: int = Field(ge=1, description="起始发布版号")
+    target_version: int = Field(ge=1, description="目标发布版号")
+    fixed_groups: list[int] = Field(
+        default_factory=list, description="切换期间不可调频的组编号")

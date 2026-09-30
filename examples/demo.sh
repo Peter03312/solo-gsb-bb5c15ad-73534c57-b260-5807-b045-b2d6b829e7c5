@@ -38,7 +38,12 @@ echo "== 6. 读取发布版 2 及其与版本 1 的差异 =="
 curl -s "$BASE/sessions/$SID/plans/2"; echo
 curl -s "$BASE/sessions/$SID/plans/2/diff"; echo
 
-echo "== 7. 用旧版本号发布会得到 409 冲突 =="
+echo "== 7. 查询版本 1 -> 2 的逐组安全调频路线（只读，不新增发布版） =="
+curl -s -X POST "$BASE/sessions/$SID/transitions" \
+  -H 'Content-Type: application/json' \
+  -d '{"start_version": 1, "target_version": 2, "fixed_groups": [3]}'; echo
+
+echo "== 8. 用旧版本号发布会得到 409 冲突 =="
 curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE/sessions/$SID/plans" \
   -H 'Content-Type: application/json' \
   -d '{"base_version": 1, "locks": []}'

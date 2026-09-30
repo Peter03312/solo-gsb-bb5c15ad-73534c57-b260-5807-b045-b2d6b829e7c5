@@ -57,6 +57,20 @@ def get_conn():
         _pool.putconn(conn)
 
 
+def get_readonly_conn():
+    """只读查询依赖：固定一个一致的数据库快照。"""
+    conn = _pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "START TRANSACTION ISOLATION LEVEL REPEATABLE READ, "
+                "READ ONLY")
+        yield conn
+    finally:
+        conn.rollback()
+        _pool.putconn(conn)
+
+
 def close_pool() -> None:
     global _pool
     if _pool is not None:

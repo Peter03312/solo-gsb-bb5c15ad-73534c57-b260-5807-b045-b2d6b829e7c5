@@ -11,6 +11,7 @@
 - 无解时返回 422 并说明涉及的锁定组或干扰关系，当前发布版不变；
 - 发布须提交所见版本号 `base_version`，过期即返回 409；并发发布只有一个
   可成功；各发布版不可变，可读取分配结果及与前版差异；
+- 可查询两个既有发布版之间的逐组安全调频路线；该查询只读，不修改发布版；
 - 起点不早于终点、引用未知组、锁定不可用频点等校验失败均返回 400 并拒绝
   整次操作。
 
@@ -48,10 +49,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 运行测试：
 
 ```bash
-pip install pytest
+python -m pip install pytest
 python -m pytest tests/            # 求解器单元测试（无需数据库）
 # 端到端集成检查（自动拉起嵌入式 PostgreSQL 与真实服务进程）：
-pip install pgserver httpx
+python -m pip install pgserver httpx
 python tests/integration_check.py
 ```
 
@@ -77,10 +78,11 @@ python tests/integration_check.py
 | GET  | `/sessions/{id}/plans` | 列出全部发布版 |
 | GET  | `/sessions/{id}/plans/{version}` | 读取指定发布版分配结果 |
 | GET  | `/sessions/{id}/plans/{version}/diff` | 与前一版的差异 |
+| POST | `/sessions/{id}/transitions` | 查询两个发布版之间的逐组安全调频路线 |
 
-状态码约定：`201` 创建/发布成功；`400` 校验失败（起点不早于终点、引用未知
-组、锁定不可用频点等）；`404` 资源不存在；`409` 版本冲突；`422` 约束不可
-满足（当前发布版不变）。
+状态码约定：创建/发布成功为 `201`，只读查询成功为 `200`；`400` 校验失败
+（起点不早于终点、引用未知组、锁定不可用频点等）；`404` 资源不存在；`409`
+版本冲突；`422` 约束不可满足（当前发布版不变）。
 
 ## 请求示例
 
@@ -119,6 +121,89 @@ curl -s http://localhost:8000/sessions/1/plans/2
 curl -s http://localhost:8000/sessions/1/plans/2/diff
 ```
 
+## 查询逐组安全调频路线
+
+现场不能把新发布版一次切换到位时，可在两个**既有、不可变**的发布版之间查询
+安全路线。接口只做规划查询，不创建或修改发布版；一次请求使用同一个只读事务
+快照读取场次频点、组、时段、干扰关系和发布版分配。
+
+```bash
+curl -s -X POST http://localhost:8000/sessions/1/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start_version": 1,
+    "target_version": 2,
+    "fixed_groups": [3]
+  }'
+```
+
+- `fixed_groups` 可省略，表示切换期间不可调频的组；这些组在两版中的频点必须
+  相同，并且路线中不会移动它们。
+- 每一步只移动一个组，新频点必须是本场次可用频点；允许先移动到其它可用频点
+  作为临时频点。
+- 每一步后的完整分配都按当前配置检查：只有左闭右开时段相交的干扰关系生效，
+  且频点绝对差不小于最小间距。
+- 先最小化步数；步数相同时，将各步的 `(group_id, to_frequency)` 按步骤顺序
+  展平，取字典序最小的路线。
+
+上面示例的响应形态如下：
+
+```json
+{
+  "session_id": 1,
+  "start_version": 1,
+  "target_version": 2,
+  "fixed_groups": [3],
+  "step_count": 2,
+  "initial_assignment": [
+    {"group_id": 1, "frequency": 1},
+    {"group_id": 2, "frequency": 4},
+    {"group_id": 3, "frequency": 1}
+  ],
+  "steps": [
+    {
+      "step": 1,
+      "group_id": 2,
+      "from_frequency": 4,
+      "to_frequency": 5,
+      "assignment": [
+        {"group_id": 1, "frequency": 1},
+        {"group_id": 2, "frequency": 5},
+        {"group_id": 3, "frequency": 1}
+      ]
+    },
+    {
+      "step": 2,
+      "group_id": 1,
+      "from_frequency": 1,
+      "to_frequency": 2,
+      "assignment": [
+        {"group_id": 1, "frequency": 2},
+        {"group_id": 2, "frequency": 5},
+        {"group_id": 3, "frequency": 1}
+      ]
+    }
+  ],
+  "target_assignment": [
+    {"group_id": 1, "frequency": 2},
+    {"group_id": 2, "frequency": 5},
+    {"group_id": 3, "frequency": 1}
+  ]
+}
+```
+
+调频路线的拒绝规则：
+
+- `400 group_set_mismatch`：起始版与目标版组集合不同；若发布版组集合与当前
+  场次配置快照不一致，则按端点不可行返回 `422 endpoint_infeasible`；
+- `400 fixed_group_unknown` / `fixed_group_repeated`：不可调频组引用非法或
+  重复；
+- `400 fixed_group_conflict`：不可调频组在起始版、目标版频点不同，需要改频；
+- `404`：场次或任一发布版不存在；
+- `422 endpoint_infeasible`：起始版或目标版在当前配置规则下不可行，并分别
+  列出缺失组、不可用频点、干扰冲突；
+- `422 no_safe_route`：两个端点本身都可行，但无法通过逐组移动到达。
+
 无解时的响应示例（422，当前发布版不变）：
 
 ```json
@@ -148,16 +233,18 @@ curl -s http://localhost:8000/sessions/1/plans/2/diff
 也可以直接运行示例脚本（需服务已启动）：
 
 ```bash
-bash examples/demo.sh
+bash examples/demo.sh          # 场次、发布、差异与调频路线综合示例
+bash examples/transition.sh    # 使用临时频点完成两版切换的独立示例
 ```
 
 ## 项目结构
 
 ```
-app/main.py    HTTP API 与发布事务（行锁串行化并发发布）
-app/solver.py  回溯 + 前向检查求解器；无解时给出不可约的锁定/干扰核心
-app/db.py      连接池、启动重试与 schema 初始化
-schema.sql     表结构（应用启动时幂等执行）
-tests/         求解器单元测试与端到端集成检查
-examples/      curl 请求示例
+app/main.py        HTTP API 与发布事务（行锁串行化并发发布）
+app/solver.py      回溯 + 前向检查求解器；无解时给出不可约的锁定/干扰核心
+app/transition.py  最短逐组调频路线 BFS（含临时频点与字典序决胜）
+app/db.py          连接池、启动重试与 schema 初始化
+schema.sql         表结构（应用启动时幂等执行）
+tests/             求解器单元测试与端到端集成检查
+examples/          curl 请求示例
 ```
