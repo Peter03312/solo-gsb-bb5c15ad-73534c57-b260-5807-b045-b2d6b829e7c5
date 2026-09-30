@@ -174,6 +174,145 @@ def main() -> int:
         r = c.get(f"/sessions/{sid}/plans")
         check("并发后版本号为 3", [p["version"] for p in r.json()] == [1, 2, 3])
 
+        # ---------------------------------------------------------------- #
+        # 逐组切换路线（只读；为获得冻结/缓冲场景另建一个场次）
+        # ---------------------------------------------------------------- #
+        r = c.post("/sessions", json={"name": "切换演示",
+                                      "frequencies": [1, 2, 3, 4, 5, 6, 7]})
+        rid = r.json()["id"]
+        check("创建切换场次", r.status_code == 201, r.text)
+        # 三组串行时段：组1[0,120) 组2[60,180) 组3[120,240)
+        rg = []
+        for name, s, e in [("a", 0, 120), ("b", 60, 180), ("c", 120, 240)]:
+            r = c.post(f"/sessions/{rid}/groups",
+                       json={"name": name, "start": s, "end": e})
+            rg.append(r.json()["id"])
+        ga, gb, gc = rg  # 组编号为全局自增，不假设从 1 开始
+        # 相邻干扰间距 3：边 ga-gb、gb-gc 生效，ga-gc 不相交不生效
+        c.post(f"/sessions/{rid}/interferences",
+               json={"group_a": ga, "group_b": gb, "min_separation": 3})
+        c.post(f"/sessions/{rid}/interferences",
+               json={"group_a": gb, "group_b": gc, "min_separation": 3})
+
+        # v1：锁定得到 (ga=1, gb=4, gc=1)
+        r = c.post(f"/sessions/{rid}/plans",
+                   json={"base_version": 0,
+                         "locks": [{"group_id": ga, "frequency": 1},
+                                   {"group_id": gb, "frequency": 4},
+                                   {"group_id": gc, "frequency": 1}]})
+        check("切换场次 v1 发布", r.status_code == 201, r.text)
+        # v2：锁定得到 (ga=4, gb=1, gc=4)
+        r = c.post(f"/sessions/{rid}/plans",
+                   json={"base_version": 1,
+                         "locks": [{"group_id": ga, "frequency": 4},
+                                   {"group_id": gb, "frequency": 1},
+                                   {"group_id": gc, "frequency": 4}]})
+        check("切换场次 v2 发布", r.status_code == 201, r.text)
+
+        # 正常求路线
+        r = c.post(f"/sessions/{rid}/retune",
+                   json={"start_version": 1, "target_version": 2,
+                         "fixed_groups": []})
+        check("切换路线 200", r.status_code == 200, r.text)
+        route = r.json()
+        check("最短 4 步", route["steps_count"] == 4, str(route["steps_count"]))
+        expected = [(gb, 7), (ga, 4), (gc, 4), (gb, 1)]
+        actual = [(s["group_id"], s["frequency"]) for s in route["steps"]]
+        check("字典序最小路线", actual == expected, str(actual))
+        # 每一步后的完整分配均满足生效约束，首步借用临时频点 7
+        check("首步为临时频点", route["steps"][0]["temporary"] is True
+              and route["steps"][0]["frequency"] == 7, str(route["steps"][0]))
+        check("后续步骤直达目标频点",
+              all(s["temporary"] is False for s in route["steps"][1:]))
+        cur = {ga: 1, gb: 4, gc: 1}
+        for st in route["steps"]:
+            cur[st["group_id"]] = st["frequency"]
+            got = {a["group_id"]: a["frequency"] for a in st["assignment"]}
+            assert got == cur
+            assert abs(got[ga] - got[gb]) >= 3 and abs(got[gb] - got[gc]) >= 3
+        check("路线终点即目标分配",
+              cur == {ga: 4, gb: 1, gc: 4}, str(cur))
+
+        # 0 步路线：同版本
+        r = c.post(f"/sessions/{rid}/retune",
+                   json={"start_version": 2, "target_version": 2})
+        check("同版本 0 步", r.status_code == 200
+              and r.json()["steps_count"] == 0, r.text)
+
+        # 引用不存在的版本 -> 400
+        r = c.post(f"/sessions/{rid}/retune",
+                   json={"start_version": 1, "target_version": 99})
+        check("目标版本非法 400", r.status_code == 400
+              and r.json()["detail"]["error"] == "invalid_reference", r.text)
+        # 引用未知 / 重复的不可调频组 -> 400
+        r = c.post(f"/sessions/{rid}/retune",
+                   json={"start_version": 1, "target_version": 2,
+                         "fixed_groups": [999999]})
+        check("未知不可调频组 400", r.status_code == 400, r.text)
+        r = c.post(f"/sessions/{rid}/retune",
+                   json={"start_version": 1, "target_version": 2,
+                         "fixed_groups": [ga, ga]})
+        check("重复不可调频组 400", r.status_code == 400, r.text)
+        # 不可调频组两版频点不同 -> 422
+        r = c.post(f"/sessions/{rid}/retune",
+                   json={"start_version": 1, "target_version": 2,
+                         "fixed_groups": [ga]})
+        check("不可调频组需改频 422", r.status_code == 422
+              and r.json()["detail"]["error"] == "fixed_group_conflict",
+              r.text)
+
+        # 端点在当前规则下不可行：新增组gd并发布 v3 后，v2 缺少 gd
+        r = c.post(f"/sessions/{rid}/groups",
+                   json={"name": "d", "start": 0, "end": 240})
+        gd = r.json()["id"]
+        c.post(f"/sessions/{rid}/interferences",
+               json={"group_a": ga, "group_b": gd, "min_separation": 1})
+        r = c.post(f"/sessions/{rid}/plans",
+                   json={"base_version": 2,
+                         "locks": [{"group_id": ga, "frequency": 4},
+                                   {"group_id": gb, "frequency": 1},
+                                   {"group_id": gc, "frequency": 4},
+                                   {"group_id": gd, "frequency": 3}]})
+        check("含组gd的 v3 发布", r.status_code == 201, r.text)
+        # v2 缺少 gd -> 两版组集合不同
+        r = c.post(f"/sessions/{rid}/retune",
+                   json={"start_version": 2, "target_version": 3})
+        check("两版组集合不同 422", r.status_code == 422
+              and r.json()["detail"]["error"] == "group_set_mismatch", r.text)
+
+        # 只读：retune 不产生新版本
+        r = c.get(f"/sessions/{rid}/plans")
+        check("路线查询不改动发布版",
+              [p["version"] for p in r.json()] == [1, 2, 3], r.text)
+
+        # 冻结场景：新场次，三组两两间距 3、频点 1..7，紧排 (1,4,7)<->(7,4,1)
+        r = c.post("/sessions", json={"name": "冻结演示",
+                                      "frequencies": [1, 2, 3, 4, 5, 6, 7]})
+        fid = r.json()["id"]
+        fg = []
+        for s, e in [(0, 240), (0, 240), (0, 240)]:
+            r = c.post(f"/sessions/{fid}/groups",
+                       json={"start": s, "end": e})
+            fg.append(r.json()["id"])
+        fa, fb, fc = fg
+        for a, b in [(fa, fb), (fa, fc), (fb, fc)]:
+            c.post(f"/sessions/{fid}/interferences",
+                   json={"group_a": a, "group_b": b, "min_separation": 3})
+        c.post(f"/sessions/{fid}/plans",
+               json={"base_version": 0,
+                     "locks": [{"group_id": fa, "frequency": 1},
+                               {"group_id": fb, "frequency": 4},
+                               {"group_id": fc, "frequency": 7}]})
+        c.post(f"/sessions/{fid}/plans",
+               json={"base_version": 1,
+                     "locks": [{"group_id": fa, "frequency": 7},
+                               {"group_id": fb, "frequency": 4},
+                               {"group_id": fc, "frequency": 1}]})
+        r = c.post(f"/sessions/{fid}/retune",
+                   json={"start_version": 1, "target_version": 2})
+        check("端点可行却无安全路线 422", r.status_code == 422
+              and r.json()["detail"]["error"] == "no_safe_route", r.text)
+
         print()
         if _failures:
             print(f"{len(_failures)} 项失败: {_failures}")

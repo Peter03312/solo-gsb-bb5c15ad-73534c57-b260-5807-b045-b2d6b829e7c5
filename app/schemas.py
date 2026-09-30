@@ -32,3 +32,13 @@ class PlanCreate(BaseModel):
     base_version: int = Field(
         ge=0, description="所见版本号；无发布版时为 0，否则为最新发布版号")
     locks: list[Lock] = Field(default_factory=list)
+
+
+class RetuneRequest(BaseModel):
+    start_version: int = Field(
+        ge=1, description="起始发布版版本号（同一场次内）")
+    target_version: int = Field(
+        ge=1, description="目标发布版版本号（同一场次内）")
+    fixed_groups: list[int] = Field(
+        default_factory=list,
+        description="切换期间不可调频的组编号；其在两版中的频点必须相同")

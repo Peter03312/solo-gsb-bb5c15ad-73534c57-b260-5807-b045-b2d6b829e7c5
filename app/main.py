@@ -8,9 +8,10 @@ from fastapi import Depends, FastAPI, HTTPException
 
 from . import db
 from .schemas import (GroupCreate, InterferenceCreate, PlanCreate,
-                      SessionCreate)
+                      RetuneRequest, SessionCreate)
 from .solver import (FrequencySolver, SolverLimitExceeded, analyze_unsat,
                      intervals_overlap)
+from .retune import RetunePlanner, RetuneLimitExceeded
 
 
 @asynccontextmanager
@@ -342,4 +343,170 @@ def get_plan_diff(session_id: int, version: int, conn=Depends(db.get_conn)):
         "added": added,
         "removed": removed,
         "unchanged": unchanged,
+    }
+
+
+# --------------------------------------------------------------------- #
+# 逐组切换路线（只读：基于一致快照计算，不改动任何发布版）
+# --------------------------------------------------------------------- #
+def _retune_error(status_code: int, code: str, message: str, **extra):
+    detail = {"error": code, "message": message, **extra}
+    return HTTPException(status_code=status_code, detail=detail)
+
+
+def _assignments_for_version(conn, session_id: int, version: int):
+    """读取指定版本的计划行与分配；计划不存在返回 None。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM plans WHERE session_id = %s AND version = %s",
+            (session_id, version))
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return _load_assignments(conn, row[0])
+
+
+def _assignment_list(assignment: dict[int, int]):
+    return [{"group_id": gid, "frequency": assignment[gid]}
+            for gid in sorted(assignment)]
+
+
+@app.post("/sessions/{session_id}/retune")
+def plan_retune(session_id: int, payload: RetuneRequest,
+                conn=Depends(db.get_conn)):
+    """计算从起始发布版到目标发布版的逐组调频切换路线（只读，不改发布版）。
+
+    每步只把一个组改到本场次可用频点（可借用临时频点），每步之后的完整
+    分配都须满足按时段相交生效的干扰关系及最小间距；不可调频组全程保持
+    不变。先最小化步骤数，再按 (组编号, 新频点) 序列取字典序最小。
+
+    本接口为只读计算：所有数据在同一个可串行化快照事务中读取，保证配置
+    快照一致，且不会创建或修改任何发布版。
+    """
+    # 显式开启只读的可重复读事务，使全部读取基于同一份配置快照
+    with conn.cursor() as cur:
+        cur.execute(
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+    try:
+        session = _load_session(conn, session_id)  # 不存在 -> 404
+        groups = _load_groups(conn, session_id)
+        group_ids = {g["id"] for g in groups}
+        interferences = _load_interferences(conn, session_id)
+
+        start = _assignments_for_version(
+            conn, session_id, payload.start_version)
+        target = _assignments_for_version(
+            conn, session_id, payload.target_version)
+        if start is None:
+            raise _retune_error(
+                400, "invalid_reference",
+                f"起始发布版 {payload.start_version} 不存在",
+                field="start_version")
+        if target is None:
+            raise _retune_error(
+                400, "invalid_reference",
+                f"目标发布版 {payload.target_version} 不存在",
+                field="target_version")
+
+        # 不可调频组：重复 / 引用非法（含引用版本之外或当前不存在的组）拒绝
+        fixed: list[int] = []
+        seen_fixed: set[int] = set()
+        for gid in payload.fixed_groups:
+            if gid in seen_fixed:
+                raise _retune_error(
+                    400, "invalid_reference",
+                    f"不可调频组 {gid} 重复指定", field="fixed_groups")
+            if gid not in group_ids:
+                raise _retune_error(
+                    400, "invalid_reference",
+                    f"不可调频组引用了未知组: {gid}", field="fixed_groups")
+            seen_fixed.add(gid)
+            fixed.append(gid)
+
+        # 两版组集合必须一致，且就是本场次当前组集合
+        start_set, target_set = set(start), set(target)
+        if start_set != target_set or start_set != group_ids:
+            only_start = sorted(start_set - target_set)
+            only_target = sorted(target_set - start_set)
+            missing_current = sorted(
+                group_ids - (start_set & target_set))
+            extra_plans = sorted((start_set | target_set) - group_ids)
+            raise _retune_error(
+                422, "group_set_mismatch",
+                "起始版与目标版的组集合不同，或与本场次当前组集合不一致，"
+                "无法逐组切换",
+                only_in_start=only_start,
+                only_in_target=only_target,
+                missing_from_plans=missing_current,
+                unknown_groups=extra_plans)
+
+        # 不可调频组在两版频点必须相同，否则需改频
+        fixed_conflicts = [
+            {"group_id": gid,
+             "start_frequency": start[gid],
+             "target_frequency": target[gid]}
+            for gid in fixed if start[gid] != target[gid]]
+        if fixed_conflicts:
+            raise _retune_error(
+                422, "fixed_group_conflict",
+                "不可调频组在起始版与目标版中的频点不同，无法全程保持不变",
+                fixed_groups=fixed_conflicts)
+
+        # 仅时段相交（左闭右开）的干扰关系在当前规则下生效
+        group_by_id = {g["id"]: g for g in groups}
+        edges = []
+        for itf in interferences:
+            ga, gb = group_by_id[itf["group_a"]], group_by_id[itf["group_b"]]
+            if intervals_overlap(ga["start"], ga["end"],
+                                 gb["start"], gb["end"]):
+                edges.append((itf["group_a"], itf["group_b"],
+                              itf["min_separation"]))
+
+        planner = RetunePlanner(
+            sorted(group_ids), session["frequencies"], edges,
+            start, target, fixed)
+        start_bad, target_bad = planner.endpoint_violations()
+        if start_bad["unavailable"] or start_bad["interferences"] \
+                or target_bad["unavailable"] or target_bad["interferences"]:
+            raise _retune_error(
+                422, "endpoint_infeasible",
+                "起始版或目标版在当前规则下不是可行分配",
+                start=start_bad, target=target_bad)
+
+        try:
+            route = planner.plan()
+        except RetuneLimitExceeded:
+            raise HTTPException(
+                status_code=503,
+                detail="切换路线搜索超出资源限制，请缩小规模后重试")
+
+        if route == "no_safe_route":
+            raise _retune_error(
+                422, "no_safe_route",
+                "两端点均可行，但不存在满足约束的逐组切换安全路线")
+    finally:
+        conn.commit()  # 提交只读事务（无任何写入），归还连接
+
+    # 回放路线，记录每步后的完整分配；新频点偏离该组目标频点即为临时频点
+    current = dict(start)
+    steps = []
+    for index, (gid, frequency) in enumerate(route, start=1):
+        current[gid] = frequency
+        steps.append({
+            "step": index,
+            "group_id": gid,
+            "frequency": frequency,
+            "temporary": frequency != target[gid],
+            "assignment": _assignment_list(current),
+        })
+
+    return {
+        "session_id": session_id,
+        "start_version": payload.start_version,
+        "target_version": payload.target_version,
+        "fixed_groups": sorted(fixed),
+        "steps_count": len(steps),
+        "start_assignment": _assignment_list(start),
+        "target_assignment": _assignment_list(target),
+        "steps": steps,
     }
